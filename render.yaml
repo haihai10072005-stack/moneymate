@@ -1,0 +1,30 @@
+# Render Blueprint — deploy 1 chạm. Vào dashboard.render.com -> New -> Blueprint -> chọn repo này.
+databases:
+  - name: moneymate-db
+    plan: free
+
+services:
+  - type: web
+    name: moneymate
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /api/status
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: moneymate-db
+          property: connectionString
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-opus-4-8
+      - key: VNP_TMN_CODE
+        sync: false
+      - key: VNP_HASH_SECRET
+        sync: false
+      - key: VNP_RETURN_URL
+        sync: false
+      - key: CASSO_WEBHOOK_TOKEN
+        sync: false

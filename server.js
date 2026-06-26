@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const querystring = require('querystring');
 
 const app = express();
+app.set('trust proxy', true); // sau proxy của Render -> lấy đúng https + domain thật
 app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 8123;
@@ -28,7 +29,7 @@ const CATS = ['Ăn uống', 'Đi lại', 'Mua sắm', 'Giải trí', 'Hoá đơn
 const VNP = {
   tmn: process.env.VNP_TMN_CODE || '', secret: process.env.VNP_HASH_SECRET || '',
   url: process.env.VNP_URL || 'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html',
-  returnUrl: process.env.VNP_RETURN_URL || ('http://localhost:' + PORT + '/api/vnpay/return')
+  returnUrl: process.env.VNP_RETURN_URL || ''  // để trống = tự lấy theo domain request
 };
 
 /* ---------- Khởi tạo dữ liệu ---------- */
@@ -217,10 +218,11 @@ app.post('/api/vnpay/create', auth(async (req, res) => {
   const amount = Math.round(Math.abs(+req.body.amount || 0));
   if (amount < 1000) return res.status(400).json({ error: 'Số tiền tối thiểu 1.000₫' });
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1').split(',')[0];
+  const returnUrl = VNP.returnUrl || (req.protocol + '://' + req.get('host') + '/api/vnpay/return');
   let p = {
     vnp_Version: '2.1.0', vnp_Command: 'pay', vnp_TmnCode: VNP.tmn, vnp_Locale: 'vn', vnp_CurrCode: 'VND',
     vnp_TxnRef: Date.now() + '_' + req.uid, vnp_OrderInfo: 'NapViMoneyMate', vnp_OrderType: 'other',
-    vnp_Amount: amount * 100, vnp_ReturnUrl: VNP.returnUrl, vnp_IpAddr: ip, vnp_CreateDate: vnpDate(new Date())
+    vnp_Amount: amount * 100, vnp_ReturnUrl: returnUrl, vnp_IpAddr: ip, vnp_CreateDate: vnpDate(new Date())
   };
   p = vnpSortObject(p);
   const signData = vnpQS(p);

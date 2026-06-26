@@ -4,6 +4,14 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>MoneyMate — Quản lý tài chính thông minh cho Gen Z</title>
+<link rel="manifest" href="/manifest.webmanifest" />
+<meta name="theme-color" content="#7C5CFC" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="MoneyMate" />
+<link rel="apple-touch-icon" href="/icon.svg" />
+<link rel="icon" href="/icon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet" />
@@ -335,7 +343,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
           <h3 style="margin-bottom:3px">Ghi nhận thu / chi</h3>
           <div class="sub">Quét hoá đơn bằng AI hoặc nhập tay — dữ liệu được lưu lại</div>
           <div class="seg" id="txTypeSeg" style="margin-bottom:14px"><button class="chip on" data-type="exp">− Khoản chi</button><button class="chip" data-type="inc">+ Khoản thu</button></div>
-          <div class="drop" id="dropZone"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3.5"/></svg><b>📸 Quét hoá đơn bằng AI</b><span>Chọn ảnh hoá đơn — AI tự điền &amp; phân loại</span></div>
+          <div class="drop" id="dropZone"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3.5"/></svg><b>📸 Chụp / đưa bill vào — AI hạch toán</b><span>Chọn ảnh hoá đơn → AI tự ghi vào sổ ngay (nhóm + ngày)</span></div>
           <input type="file" id="receiptInput" accept="image/*" style="display:none" />
           <div class="field"><label id="txNameLabel">Tên khoản chi</label><input id="txName" placeholder="VD: Cà phê Highlands" /></div>
           <div class="field"><label>Số tiền (₫)</label><input id="txAmt" type="number" placeholder="45000" /></div>
@@ -729,7 +737,7 @@ function renderTx(){
     const bg=inc?'var(--mint-soft)':(meta?meta.color+'22':'var(--line)');
     const ic=inc?'M12 19V5M5 12l7-7 7 7':(meta?meta.icon:'M12 5v14M5 12l7 7 7-7');
     const stroke=inc?C.mint:(meta?meta.color:C.muted);
-    const src=t.src==='bank'?' · 🏦 ngân hàng':'';
+    const src=t.src==='bank'?' · 🏦 ngân hàng':t.src==='bill'?' · 🧾 từ bill':t.src==='vnpay'?' · 💳 VNPAY':'';
     return `<div class="tx"><div class="ic" style="background:${bg}"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="${stroke}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${ic}"/></svg></div><div><div class="name">${esc(t.name)}</div><div class="cat">${t.cat}${t.d?' · '+t.d:''}${src}</div></div><div class="val ${inc?'green':''}">${inc?'+':''}${fmt(t.val)}</div><button class="del" onclick="delTx(${idx})" title="Xoá"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg></button></div>`;
   }).join(''):'<div class="empty">Chưa có giao dịch nào.<br>Thêm khoản thu/chi đầu tiên của bạn nhé! 👆</div>';
 }
@@ -910,16 +918,29 @@ document.getElementById('aiStatus').onclick=openSettings;
 document.getElementById('dropZone').onclick=()=>document.getElementById('receiptInput').click();
 document.getElementById('receiptInput').addEventListener('change',e=>{const f=e.target.files[0];if(f)scanReceipt(f);e.target.value='';});
 function readDataURL(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(file);});}
+function autoBook(name,amt,cat,date){
+  const d=(/^\d{1,2}\/\d{1,2}$/.test(date||''))?date:todayStr();
+  txData.unshift({name:name||'Hoá đơn',cat,val:-Math.abs(amt),d,m:curMonth,src:'bill'});
+  touchStreak();saveData();refresh();
+}
 async function scanReceipt(file){
   const url=await readDataURL(file),m=url.match(/^data:(image\/[\w.+-]+);base64,(.+)$/);
   if(!m){toast('File ảnh không hợp lệ');return;}
   if(hasAI()){
-    toast('🔍 AI đang đọc hoá đơn...');
-    try{const sys='Bạn là công cụ trích xuất hoá đơn. Chỉ trả về DUY NHẤT một JSON, không giải thích: {"merchant":"tên","amount":số_VND_number,"category":"một trong: Ăn uống, Đi lại, Mua sắm, Giải trí, Hoá đơn, Sức khoẻ, Khác"}.';
-      const txt=await aiChat(sys,[{role:'user',content:[{type:'image',source:{type:'base64',media_type:m[1],data:m[2]}},{type:'text',text:'Trích xuất hoá đơn này thành JSON.'}]}],400);
-      const j=JSON.parse(txt.match(/\{[\s\S]*\}/)[0]);fillScan(j.merchant||'Hoá đơn',Math.abs(parseInt(j.amount))||0,CATS.some(c=>c.name===j.category)?j.category:'Khác');toast('✓ AI đã quét: '+(j.merchant||'hoá đơn'));
+    toast('🧾 AI đang đọc & hạch toán hoá đơn...');
+    try{const sys='Bạn trích xuất hoá đơn Việt Nam. Chỉ trả về DUY NHẤT một JSON, không giải thích: {"merchant":"tên cửa hàng","amount":tổng_tiền_VND_dạng_number,"category":"một trong: '+CATS.map(c=>c.name).join(', ')+'","date":"dd/mm nếu thấy, nếu không thì rỗng"}.';
+      const txt=await aiChat(sys,[{role:'user',content:[{type:'image',source:{type:'base64',media_type:m[1],data:m[2]}},{type:'text',text:'Trích xuất hoá đơn này.'}]}],500);
+      const j=JSON.parse(txt.match(/\{[\s\S]*\}/)[0]);
+      const amt=Math.abs(parseInt(j.amount))||0, cat=CATS.some(c=>c.name===j.category)?j.category:'Khác';
+      if(!amt){fillScan(j.merchant||'Hoá đơn',0,cat);toast('AI chưa đọc rõ số tiền — bạn nhập tay giúp nhé');return;}
+      autoBook(j.merchant,amt,cat,j.date);
+      toast('✅ AI đã hạch toán: '+(j.merchant||'hoá đơn')+' '+fmt(amt)+' → '+cat);
     }catch(e){toast('⚠️ Quét lỗi: '+e.message);}
-  }else{toast('🔍 Đang quét (demo)...');await delay(900);const demo=[['Highlands Coffee',65000,'Ăn uống'],['Grab Bike',38000,'Đi lại'],['Circle K',92000,'Ăn uống'],['Shopee',259000,'Mua sắm']];const d=demo[Math.floor(Math.random()*demo.length)];fillScan(d[0],d[1],d[2]);toast('✓ Đã quét (demo): '+d[0]+' · bật AI thật để đọc ảnh thật');}
+  }else{
+    toast('🧾 Đang đọc bill (demo)...');await delay(900);
+    const demo=[['Highlands Coffee',65000,'Ăn uống'],['Grab Bike',38000,'Đi lại'],['Circle K',92000,'Ăn uống'],['Shopee',259000,'Mua sắm']];const d=demo[Math.floor(Math.random()*demo.length)];
+    autoBook(d[0],d[1],d[2]);toast('✅ Đã hạch toán (demo): '+d[0]+' '+fmt(d[1])+' → '+d[2]+' · bật AI thật để đọc ảnh thật');
+  }
 }
 function fillScan(name,amt,cat){document.querySelector('#txTypeSeg .chip[data-type="exp"]').click();document.getElementById('txName').value=name;document.getElementById('txAmt').value=amt;const sel=document.getElementById('txCat');if([...sel.options].some(o=>o.value===cat)){sel.value=cat;applyCat(cat,'🤖 AI');}}
 
@@ -1117,6 +1138,7 @@ async function startApp(){
   if(SERVER&&!ME){document.getElementById('authScreen').classList.add('show');}
   else{await startApp();}
 })();
+if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));}
 </script>
 </body>
 </html>

@@ -20,6 +20,8 @@ app.use(express.json({ limit: '15mb' }));
 const PORT = process.env.PORT || 8123;
 const KEY = process.env.ANTHROPIC_API_KEY || '';
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-opus-4-8';
+const GEMINI_KEY = process.env.GEMINI_API_KEY || '';            // miễn phí tại https://aistudio.google.com/apikey
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const CASSO_TOKEN = process.env.CASSO_WEBHOOK_TOKEN || '';
 const DB_FILE = path.join(__dirname, 'db.json');
 const CATS = ['Ăn uống', 'Đi lại', 'Mua sắm', 'Giải trí', 'Hoá đơn', 'Sức khoẻ', 'Giáo dục', 'Khác'];
@@ -81,9 +83,9 @@ function auth(handler) { // wrapper: nạp db + user
   };
 }
 
-/* ---------- Claude ---------- */
-async function claude(system, messages, maxTokens) {
-  if (!KEY) { const e = new Error('Server chưa cấu hình ANTHROPIC_API_KEY (.env)'); e.code = 503; throw e; }
+/* ---------- AI: Claude (trả phí) hoặc Gemini (free) ---------- */
+const HAS_AI = () => !!(KEY || GEMINI_KEY);
+async function claudeCall(system, messages, maxTokens) {
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({ model: MODEL, max_tokens: maxTokens || 1024, system, messages })
@@ -92,9 +94,34 @@ async function claude(system, messages, maxTokens) {
   const j = await r.json();
   return j.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
 }
+// chuyển message kiểu Claude (role/content[, image base64]) sang định dạng Gemini
+async function geminiCall(system, messages, maxTokens) {
+  const contents = (messages || []).map(m => {
+    let parts;
+    if (typeof m.content === 'string') parts = [{ text: m.content }];
+    else parts = (m.content || []).map(c => c.type === 'image'
+      ? { inlineData: { mimeType: c.source.media_type, data: c.source.data } }
+      : { text: c.text || '' });
+    return { role: m.role === 'assistant' ? 'model' : 'user', parts };
+  });
+  const body = { contents, generationConfig: { maxOutputTokens: Math.max(maxTokens || 1024, 256) } };
+  if (system) body.systemInstruction = { parts: [{ text: system }] };
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_KEY, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+  });
+  if (!r.ok) { let m = 'HTTP ' + r.status; try { m = (await r.json()).error?.message || m; } catch (e) {} const err = new Error(m); err.code = r.status; throw err; }
+  const j = await r.json();
+  const cand = j.candidates && j.candidates[0];
+  return ((cand && cand.content && cand.content.parts) || []).map(p => p.text || '').join('').trim();
+}
+async function aiComplete(system, messages, maxTokens) {
+  if (KEY) return claudeCall(system, messages, maxTokens);
+  if (GEMINI_KEY) return geminiCall(system, messages, maxTokens);
+  const e = new Error('Server chưa cấu hình AI (đặt GEMINI_API_KEY — free, hoặc ANTHROPIC_API_KEY trong .env)'); e.code = 503; throw e;
+}
 async function categorize(text) {
-  if (!KEY || !text) return null;
-  try { const r = await claude('Phân loại giao dịch vào ĐÚNG MỘT nhóm, chỉ trả tên nhóm: ' + CATS.join(', ') + '.', [{ role: 'user', content: String(text) }], 20); return CATS.find(c => r.includes(c)) || null; }
+  if (!HAS_AI() || !text) return null;
+  try { const r = await aiComplete('Phân loại giao dịch vào ĐÚNG MỘT nhóm, chỉ trả tên nhóm: ' + CATS.join(', ') + '.', [{ role: 'user', content: String(text) }], 30); return CATS.find(c => r.includes(c)) || null; }
   catch (e) { return null; }
 }
 
@@ -126,14 +153,14 @@ app.get('/api/me', auth(async (req, res) => res.json({ user: pubUser(req.user) }
 app.post('/api/logout', auth(async (req, res) => { const t = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); delete req.db.tokens[t]; await writeDB(req.db); res.json({ ok: true }); }));
 
 /* ---------- Data ---------- */
-app.get('/api/status', (req, res) => res.json({ ai: !!KEY, model: MODEL, casso: !!CASSO_TOKEN, vnpay: !!(VNP.tmn && VNP.secret), pg: USE_PG }));
+app.get('/api/status', (req, res) => res.json({ ai: HAS_AI(), provider: KEY ? 'claude' : (GEMINI_KEY ? 'gemini' : 'none'), model: KEY ? MODEL : (GEMINI_KEY ? GEMINI_MODEL : null), casso: !!CASSO_TOKEN, vnpay: !!(VNP.tmn && VNP.secret), pg: USE_PG }));
 app.get('/api/data', auth(async (req, res) => res.json(req.user.data || emptyFinance())));
 app.post('/api/data', auth(async (req, res) => { req.user.data = req.body || emptyFinance(); await writeDB(req.db); res.json({ ok: true }); }));
 app.post('/api/reset', auth(async (req, res) => { req.user.data = emptyFinance(); await writeDB(req.db); res.json(req.user.data); }));
 
 /* ---------- AI ---------- */
 app.post('/api/chat', async (req, res) => {
-  try { const { system, messages, max_tokens } = req.body || {}; res.json({ text: await claude(system, messages, max_tokens) }); }
+  try { const { system, messages, max_tokens } = req.body || {}; res.json({ text: await aiComplete(system, messages, max_tokens) }); }
   catch (e) { res.status(e.code || 500).json({ error: e.message || String(e) }); }
 });
 app.post('/api/categorize', async (req, res) => { res.json({ category: await categorize((req.body || {}).text || '') }); });
@@ -154,7 +181,7 @@ app.post('/api/casso/simulate', auth(async (req, res) => {
   const tx = { description: s.description, amount: s.amount, when: new Date().toISOString() };
   if (tx.amount < 0) tx.category = (await categorize(tx.description)) || 'Khác';
   applyBankTx(req.user.data, tx); await writeDB(req.db);
-  res.json({ tx, aiCategorized: !!KEY });
+  res.json({ tx, aiCategorized: HAS_AI() });
 }));
 app.post('/api/webhooks/casso', async (req, res) => {
   try {
@@ -261,6 +288,6 @@ initStore().then(() => {
   app.listen(PORT, () => {
     console.log('  MoneyMate  ->  http://localhost:' + PORT);
     console.log('  Lưu trữ: ' + (USE_PG ? 'PostgreSQL (DATABASE_URL)' : 'db.json (local)'));
-    console.log('  AI: ' + (KEY ? 'BẬT (' + MODEL + ')' : 'TẮT') + ' | VNPAY: ' + (VNP.tmn ? 'BẬT' : 'chưa cấu hình'));
+    console.log('  AI: ' + (KEY ? 'Claude (' + MODEL + ')' : (GEMINI_KEY ? 'Gemini FREE (' + GEMINI_MODEL + ')' : 'TẮT')) + ' | VNPAY: ' + (VNP.tmn ? 'BẬT' : 'chưa cấu hình'));
   });
 }).catch(e => { console.error('Khởi tạo lưu trữ thất bại:', e.message); process.exit(1); });

@@ -16,6 +16,8 @@ services:
         fromDatabase:
           name: moneymate-db
           property: connectionString
+      - key: GEMINI_API_KEY
+        sync: false
       - key: ANTHROPIC_API_KEY
         sync: false
       - key: ANTHROPIC_MODEL

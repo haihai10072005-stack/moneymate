@@ -249,6 +249,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
     <div class="field" style="margin-bottom:8px"><label>Mật khẩu</label><input id="authPw" type="password" placeholder="••••••" autocomplete="current-password" /></div>
     <div class="auth-err" id="authErr"></div>
     <button class="btn" id="authBtn">Đăng nhập</button>
+    <div style="text-align:center;margin-top:11px"><a id="forgotLink" style="color:var(--violet);cursor:pointer;font-weight:600;font-size:12.5px">Quên mật khẩu?</a></div>
     <div class="auth-hint" id="authHint">💡 Demo: đăng ký nhanh 1 tài khoản bất kỳ để bắt đầu. Dữ liệu lưu riêng cho bạn.</div>
   </div>
 </div>
@@ -506,6 +507,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
       <div class="field"><label>Anthropic API Key (chỉ cần khi mở trực tiếp, không qua server)</label><input id="apiKeyInput" type="password" placeholder="sk-ant-..." /></div>
       <div style="display:flex;gap:10px;margin-bottom:14px"><button class="btn ghost" id="clearKey" style="flex:1">Xoá key</button><button class="btn" id="saveKey" style="flex:2">Lưu key</button></div>
     </div>
+    <button class="btn ghost" id="changePwBtn" style="width:100%;margin-bottom:10px;display:none">🔑 Đổi mật khẩu</button>
     <button class="btn ghost" id="loadSampleBtn" style="width:100%;margin-bottom:10px">📥 Nạp dữ liệu mẫu (xem ví dụ)</button>
     <button class="btn danger" id="resetData" style="width:100%">🗑 Xoá toàn bộ dữ liệu — bắt đầu trống</button>
     <button class="btn ghost" id="logoutBtn" style="width:100%;margin-top:10px;display:none">↩ Đăng xuất</button>
@@ -954,6 +956,7 @@ function openSettings(){
   else{st.innerHTML='📂 Bạn đang mở file trực tiếp (không qua server). Có thể nhập key tạm bên dưới (lưu trong trình duyệt). Khuyến nghị chạy <code>npm start</code> để dùng backend.';box.style.display='block';}
   if(SERVER&&ME)st.innerHTML='👤 Đăng nhập: <b>'+esc(ME.name)+'</b> ('+esc(ME.email)+')<br>'+st.innerHTML;
   document.getElementById('logoutBtn').style.display=(SERVER&&ME)?'block':'none';
+  document.getElementById('changePwBtn').style.display=(SERVER&&ME)?'block':'none';
   modal.classList.add('show');
 }
 document.getElementById('settingsBtn').onclick=openSettings;
@@ -1078,6 +1081,25 @@ document.getElementById('tabLogin').onclick=()=>setAuthMode('login');
 document.getElementById('tabReg').onclick=()=>setAuthMode('register');
 document.getElementById('authBtn').onclick=doAuth;
 document.getElementById('authPw').addEventListener('keydown',e=>{if(e.key==='Enter')doAuth();});
+async function doForgot(){
+  const email=document.getElementById('authEmail').value.trim()||prompt('Nhập email tài khoản của bạn:');
+  if(!email)return;
+  try{const r=await fetch('/api/forgot',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email})});const j=await r.json();
+    if(j.devLink){if(confirm('Server chưa cấu hình gửi email. Mở link đặt lại mật khẩu ngay bây giờ?\n\n'+j.devLink))location.href=j.devLink;}
+    else toast('Nếu email tồn tại, hướng dẫn đặt lại đã được gửi 📧');
+  }catch(e){authErr('Lỗi: '+e.message);}
+}
+async function doResetPassword(token){
+  const np=prompt('🔑 Đặt MẬT KHẨU MỚI cho tài khoản (tối thiểu 4 ký tự):');
+  if(np){try{const r=await fetch('/api/reset-password',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token,newPassword:np})});const j=await r.json();toast(r.ok?'✅ Đã đổi mật khẩu — đăng nhập lại nhé':'⚠️ '+(j.error||'Lỗi'));}catch(e){toast('Lỗi: '+e.message);}}
+  history.replaceState({},'',location.pathname);
+}
+document.getElementById('forgotLink').onclick=doForgot;
+document.getElementById('changePwBtn').onclick=async()=>{
+  const oldP=prompt('Mật khẩu hiện tại:');if(oldP===null)return;
+  const newP=prompt('Mật khẩu mới (≥4 ký tự):');if(!newP)return;
+  try{const r=await authFetch('/api/change-password',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({oldPassword:oldP,newPassword:newP})});const j=await r.json();toast(r.ok?'✅ Đã đổi mật khẩu':'⚠️ '+(j.error||'Lỗi'));if(r.ok)document.getElementById('settingsModal').classList.remove('show');}catch(e){toast('Lỗi: '+e.message);}
+};
 
 /* ===== Social: quỹ nhóm + leaderboard ===== */
 let funds=[];
@@ -1135,6 +1157,8 @@ async function startApp(){
   rebuildCatSelect();
   setTheme(localStorage.getItem('mm_theme')||'light');
   setAuthMode('login');
+  const rp=new URLSearchParams(location.search).get('reset');
+  if(rp&&SERVER){await doResetPassword(rp);}
   if(SERVER&&!ME){document.getElementById('authScreen').classList.add('show');}
   else{await startApp();}
 })();

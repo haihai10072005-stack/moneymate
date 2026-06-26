@@ -1,90 +1,57 @@
 /**
  * MoneyMate backend — Express (đa người dùng, production-ready)
- * - Lưu trữ: Postgres (nếu có DATABASE_URL) hoặc db.json (local fallback)
- * - Auth: đăng ký/đăng nhập (scrypt + token)
- * - AI: proxy Claude (chat / quét hoá đơn / phân loại)
- * - Casso (Open Banking) webhook → AI phân loại
- * - VNPAY sandbox: tạo URL thanh toán + verify return (nạp ví)
- * - Social: quỹ nhóm + bảng xếp hạng
+ * - Lưu trữ: db.js (Postgres per-row hoặc db.json) — chống đè dữ liệu khi nhiều người dùng
+ * - Auth: đăng ký/đăng nhập, đổi mật khẩu, quên mật khẩu, giới hạn đăng nhập sai
+ * - AI: Claude (trả phí) hoặc Gemini (free)
+ * - Casso webhook, VNPAY sandbox, Social (quỹ nhóm + leaderboard)
  */
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
-const fs = require('fs');
 const crypto = require('crypto');
-const querystring = require('querystring');
+const store = require('./db');
 
 const app = express();
-app.set('trust proxy', true); // sau proxy của Render -> lấy đúng https + domain thật
+app.set('trust proxy', true);
 app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 8123;
 const KEY = process.env.ANTHROPIC_API_KEY || '';
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-opus-4-8';
-const GEMINI_KEY = process.env.GEMINI_API_KEY || '';            // miễn phí tại https://aistudio.google.com/apikey
+const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const CASSO_TOKEN = process.env.CASSO_WEBHOOK_TOKEN || '';
-const DB_FILE = path.join(__dirname, 'db.json');
 const CATS = ['Ăn uống', 'Đi lại', 'Mua sắm', 'Giải trí', 'Hoá đơn', 'Sức khoẻ', 'Giáo dục', 'Khác'];
 const VNP = {
   tmn: process.env.VNP_TMN_CODE || '', secret: process.env.VNP_HASH_SECRET || '',
   url: process.env.VNP_URL || 'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html',
-  returnUrl: process.env.VNP_RETURN_URL || ''  // để trống = tự lấy theo domain request
+  returnUrl: process.env.VNP_RETURN_URL || ''
 };
-
-/* ---------- Khởi tạo dữ liệu ---------- */
-function emptyFinance() {
-  return {
-    balance: 0, tx: [],
-    budgets: [
-      { name: 'Ăn uống', limit: 3000000 }, { name: 'Đi lại', limit: 1500000 },
-      { name: 'Mua sắm', limit: 2000000 }, { name: 'Giải trí', limit: 1500000 },
-      { name: 'Hoá đơn', limit: 1500000 }
-    ],
-    goals: [], streak: { count: 0, last: '' }, challenges: [], badges: [], subs: []
-  };
-}
-function emptyDB() { return { users: {}, tokens: {}, funds: [] }; }
-function coerce(d) { if (!d || typeof d !== 'object') d = emptyDB(); if (!d.users) d.users = {}; if (!d.tokens) d.tokens = {}; if (!Array.isArray(d.funds)) d.funds = []; return d; }
-
-/* ---------- Storage: Postgres hoặc JSON ---------- */
-const USE_PG = !!process.env.DATABASE_URL;
-let pool;
-async function initStore() {
-  if (!USE_PG) return;
-  const { Pool } = require('pg');
-  pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === 'disable' ? false : { rejectUnauthorized: false } });
-  await pool.query('CREATE TABLE IF NOT EXISTS kv (k text PRIMARY KEY, v jsonb)');
-  const r = await pool.query("SELECT v FROM kv WHERE k='db'");
-  if (!r.rows.length) await pool.query("INSERT INTO kv(k,v) VALUES('db',$1)", [JSON.stringify(emptyDB())]);
-}
-async function readDB() {
-  if (USE_PG) { const r = await pool.query("SELECT v FROM kv WHERE k='db'"); return coerce(r.rows[0] ? r.rows[0].v : emptyDB()); }
-  try { return coerce(JSON.parse(fs.readFileSync(DB_FILE, 'utf8'))); } catch (e) { return emptyDB(); }
-}
-async function writeDB(d) {
-  if (USE_PG) { await pool.query("INSERT INTO kv(k,v) VALUES('db',$1) ON CONFLICT (k) DO UPDATE SET v=$1", [JSON.stringify(d)]); }
-  else fs.writeFileSync(DB_FILE, JSON.stringify(d, null, 2));
-}
 
 /* ---------- Auth helpers ---------- */
 const hashPw = (pw, salt) => crypto.scryptSync(String(pw), salt, 32).toString('hex');
 const rid = p => p + crypto.randomBytes(7).toString('hex');
 const newToken = () => crypto.randomBytes(24).toString('hex');
 const pubUser = u => ({ id: u.id, name: u.name, email: u.email });
-function auth(handler) { // wrapper: nạp db + user
+function auth(handler) {
   return async (req, res) => {
     try {
       const t = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-      const db = await readDB(); const uid = db.tokens[t];
-      if (!uid || !db.users[uid]) return res.status(401).json({ error: 'Chưa đăng nhập' });
-      req.db = db; req.uid = uid; req.user = db.users[uid];
+      const uid = await store.tokenUser(t);
+      const user = uid ? await store.userById(uid) : null;
+      if (!user) return res.status(401).json({ error: 'Chưa đăng nhập' });
+      req.uid = uid; req.user = user;
       await handler(req, res);
     } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
   };
 }
+// chống dò mật khẩu: khoá tạm theo email sau nhiều lần sai
+const loginFails = new Map();
+const loginBlocked = email => { const f = loginFails.get(email); return (f && f.n >= 5 && f.until > Date.now()) ? Math.ceil((f.until - Date.now()) / 1000) : 0; };
+const loginFail = email => { const f = loginFails.get(email) || { n: 0, until: 0 }; f.n++; f.until = Date.now() + (f.n >= 5 ? 300000 : 60000); loginFails.set(email, f); };
+const loginOk = email => loginFails.delete(email);
 
-/* ---------- AI: Claude (trả phí) hoặc Gemini (free) ---------- */
+/* ---------- AI: Claude hoặc Gemini (free) ---------- */
 const HAS_AI = () => !!(KEY || GEMINI_KEY);
 async function claudeCall(system, messages, maxTokens) {
   const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -95,14 +62,11 @@ async function claudeCall(system, messages, maxTokens) {
   const j = await r.json();
   return j.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
 }
-// chuyển message kiểu Claude (role/content[, image base64]) sang định dạng Gemini
 async function geminiCall(system, messages, maxTokens) {
   const contents = (messages || []).map(m => {
     let parts;
     if (typeof m.content === 'string') parts = [{ text: m.content }];
-    else parts = (m.content || []).map(c => c.type === 'image'
-      ? { inlineData: { mimeType: c.source.media_type, data: c.source.data } }
-      : { text: c.text || '' });
+    else parts = (m.content || []).map(c => c.type === 'image' ? { inlineData: { mimeType: c.source.media_type, data: c.source.data } } : { text: c.text || '' });
     return { role: m.role === 'assistant' ? 'model' : 'user', parts };
   });
   const body = { contents, generationConfig: { maxOutputTokens: Math.max(maxTokens || 1024, 256) } };
@@ -126,38 +90,87 @@ async function categorize(text) {
   catch (e) { return null; }
 }
 
+/* ---------- Email (tuỳ chọn, qua Resend) ---------- */
+async function sendResetEmail(to, link) {
+  const k = process.env.RESEND_API_KEY, from = process.env.MAIL_FROM;
+  if (!k || !from) return false;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST', headers: { authorization: 'Bearer ' + k, 'content-type': 'application/json' },
+      body: JSON.stringify({ from, to, subject: 'Đặt lại mật khẩu MoneyMate', html: '<p>Bấm để đặt lại mật khẩu: <a href="' + link + '">' + link + '</a></p><p>Link hết hạn sau 1 giờ. Nếu không phải bạn, bỏ qua email này.</p>' })
+    });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
 /* ---------- Auth routes ---------- */
 app.post('/api/register', async (req, res) => {
   try {
     const { name, email, password } = req.body || {};
     if (!name || !email || !password) return res.status(400).json({ error: 'Thiếu thông tin' });
     if (String(password).length < 4) return res.status(400).json({ error: 'Mật khẩu tối thiểu 4 ký tự' });
-    const db = await readDB();
-    if (Object.values(db.users).some(u => u.email.toLowerCase() === email.toLowerCase())) return res.status(409).json({ error: 'Email đã được dùng' });
+    if (await store.userByEmail(email)) return res.status(409).json({ error: 'Email đã được dùng' });
     const id = rid('u_'), salt = crypto.randomBytes(8).toString('hex');
-    db.users[id] = { id, name, email, salt, passHash: hashPw(password, salt), createdAt: Date.now(), data: emptyFinance() };
-    const token = newToken(); db.tokens[token] = id; await writeDB(db);
-    res.json({ token, user: pubUser(db.users[id]) });
+    const u = { id, email, name, salt, passHash: hashPw(password, salt), createdAt: Date.now(), data: store.emptyFinance() };
+    await store.createUser(u);
+    const token = newToken(); await store.addToken(token, id);
+    res.json({ token, user: pubUser(u) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    const db = await readDB();
-    const u = Object.values(db.users).find(x => x.email.toLowerCase() === String(email || '').toLowerCase());
-    if (!u || u.passHash !== hashPw(password || '', u.salt)) return res.status(401).json({ error: 'Sai email hoặc mật khẩu' });
-    const token = newToken(); db.tokens[token] = u.id; await writeDB(db);
+    const em = String(email || '').toLowerCase();
+    const wait = loginBlocked(em);
+    if (wait) return res.status(429).json({ error: 'Sai quá nhiều lần. Thử lại sau ' + wait + ' giây.' });
+    const u = await store.userByEmail(em);
+    if (!u || u.passHash !== hashPw(password || '', u.salt)) { loginFail(em); return res.status(401).json({ error: 'Sai email hoặc mật khẩu' }); }
+    loginOk(em);
+    const token = newToken(); await store.addToken(token, u.id);
     res.json({ token, user: pubUser(u) });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 app.get('/api/me', auth(async (req, res) => res.json({ user: pubUser(req.user) })));
-app.post('/api/logout', auth(async (req, res) => { const t = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); delete req.db.tokens[t]; await writeDB(req.db); res.json({ ok: true }); }));
+app.post('/api/logout', auth(async (req, res) => { const t = (req.headers.authorization || '').replace(/^Bearer\s+/i, ''); await store.delToken(t); res.json({ ok: true }); }));
+app.post('/api/change-password', auth(async (req, res) => {
+  const { oldPassword, newPassword } = req.body || {};
+  if (!newPassword || String(newPassword).length < 4) return res.status(400).json({ error: 'Mật khẩu mới tối thiểu 4 ký tự' });
+  if (req.user.passHash !== hashPw(oldPassword || '', req.user.salt)) return res.status(401).json({ error: 'Mật khẩu hiện tại không đúng' });
+  const salt = crypto.randomBytes(8).toString('hex');
+  await store.setPassword(req.uid, salt, hashPw(newPassword, salt));
+  res.json({ ok: true });
+}));
+app.post('/api/forgot', async (req, res) => {
+  try {
+    const email = String((req.body || {}).email || '').trim();
+    const u = await store.userByEmail(email);
+    if (u) {
+      const token = crypto.randomBytes(20).toString('hex');
+      await store.setReset(u.id, token, Date.now() + 3600000);
+      const link = req.protocol + '://' + req.get('host') + '/?reset=' + token;
+      const sent = await sendResetEmail(u.email, link);
+      return res.json(sent ? { ok: true, sent: true } : { ok: true, sent: false, devLink: link });
+    }
+    res.json({ ok: true, sent: false }); // không tiết lộ email có tồn tại hay không
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!newPassword || String(newPassword).length < 4) return res.status(400).json({ error: 'Mật khẩu mới tối thiểu 4 ký tự' });
+    const u = await store.userByReset(token || '');
+    if (!u) return res.status(400).json({ error: 'Link đặt lại không hợp lệ hoặc đã hết hạn' });
+    const salt = crypto.randomBytes(8).toString('hex');
+    await store.setPassword(u.id, salt, hashPw(newPassword, salt));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
 
 /* ---------- Data ---------- */
-app.get('/api/status', (req, res) => res.json({ ai: HAS_AI(), provider: KEY ? 'claude' : (GEMINI_KEY ? 'gemini' : 'none'), model: KEY ? MODEL : (GEMINI_KEY ? GEMINI_MODEL : null), casso: !!CASSO_TOKEN, vnpay: !!(VNP.tmn && VNP.secret), pg: USE_PG }));
-app.get('/api/data', auth(async (req, res) => res.json(req.user.data || emptyFinance())));
-app.post('/api/data', auth(async (req, res) => { req.user.data = req.body || emptyFinance(); await writeDB(req.db); res.json({ ok: true }); }));
-app.post('/api/reset', auth(async (req, res) => { req.user.data = emptyFinance(); await writeDB(req.db); res.json(req.user.data); }));
+app.get('/api/status', (req, res) => res.json({ ai: HAS_AI(), provider: KEY ? 'claude' : (GEMINI_KEY ? 'gemini' : 'none'), model: KEY ? MODEL : (GEMINI_KEY ? GEMINI_MODEL : null), casso: !!CASSO_TOKEN, vnpay: !!(VNP.tmn && VNP.secret), pg: store.usingPg() }));
+app.get('/api/data', auth(async (req, res) => res.json(req.user.data || store.emptyFinance())));
+app.post('/api/data', auth(async (req, res) => { await store.saveUserData(req.uid, req.body || store.emptyFinance()); res.json({ ok: true }); }));
+app.post('/api/reset', auth(async (req, res) => { const d = store.emptyFinance(); await store.saveUserData(req.uid, d); res.json(d); }));
 
 /* ---------- AI ---------- */
 app.post('/api/chat', async (req, res) => {
@@ -181,40 +194,38 @@ app.post('/api/casso/simulate', auth(async (req, res) => {
   const s = samples[Math.floor(Math.random() * samples.length)];
   const tx = { description: s.description, amount: s.amount, when: new Date().toISOString() };
   if (tx.amount < 0) tx.category = (await categorize(tx.description)) || 'Khác';
-  applyBankTx(req.user.data, tx); await writeDB(req.db);
+  applyBankTx(req.user.data, tx); await store.saveUserData(req.uid, req.user.data);
   res.json({ tx, aiCategorized: HAS_AI() });
 }));
 app.post('/api/webhooks/casso', async (req, res) => {
   try {
     const token = req.headers['secure-token'] || (req.headers['authorization'] || '').replace(/^Apikey\s+/i, '');
     if (CASSO_TOKEN && token !== CASSO_TOKEN) return res.status(401).json({ error: 1, message: 'invalid token' });
-    const db = await readDB();
     const email = (req.query.email || '').toLowerCase();
-    const user = email ? Object.values(db.users).find(u => u.email.toLowerCase() === email) : Object.values(db.users)[0];
+    const user = email ? await store.userByEmail(email) : await store.firstUser();
     if (!user) return res.json({ success: true, note: 'no user' });
     for (const t of (req.body && req.body.data) || []) {
       const tx = { description: t.description, amount: Number(t.amount), when: t.when };
       if (tx.amount < 0) tx.category = (await categorize(tx.description)) || 'Khác';
       applyBankTx(user.data, tx);
     }
-    await writeDB(db); res.json({ success: true });
+    await store.saveUserData(user.id, user.data);
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 /* ---------- VNPAY sandbox ---------- */
 function vnpSortObject(obj) {
-  const sorted = {}; const str = [];
+  const sorted = {}, str = [];
   for (const key in obj) if (Object.prototype.hasOwnProperty.call(obj, key)) str.push(encodeURIComponent(key));
   str.sort();
   for (let i = 0; i < str.length; i++) sorted[str[i]] = encodeURIComponent(obj[str[i]]).replace(/%20/g, '+');
   return sorted;
 }
-function vnpDate(d) { const p = n => ('' + n).padStart(2, '0'); return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()); }
-// build "k=v&k=v" — giá trị đã được vnpSortObject encode sẵn (KHÔNG encode lại)
+const vnpDate = d => { const p = n => ('' + n).padStart(2, '0'); return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()); };
 const vnpQS = p => Object.keys(p).map(k => k + '=' + p[k]).join('&');
-// Tạo URL thanh toán (nạp ví). Cần đăng nhập + đã cấu hình VNP_TMN_CODE/VNP_HASH_SECRET.
 app.post('/api/vnpay/create', auth(async (req, res) => {
-  if (!VNP.tmn || !VNP.secret) return res.status(503).json({ error: 'Chưa cấu hình VNPAY. Đăng ký sandbox tại sandbox.vnpayment.vn rồi thêm VNP_TMN_CODE & VNP_HASH_SECRET vào .env.' });
+  if (!VNP.tmn || !VNP.secret) return res.status(503).json({ error: 'Chưa cấu hình VNPAY. Đăng ký sandbox tại sandbox.vnpayment.vn/devreg rồi thêm VNP_TMN_CODE & VNP_HASH_SECRET vào .env.' });
   const amount = Math.round(Math.abs(+req.body.amount || 0));
   if (amount < 1000) return res.status(400).json({ error: 'Số tiền tối thiểu 1.000₫' });
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1').split(',')[0];
@@ -225,29 +236,24 @@ app.post('/api/vnpay/create', auth(async (req, res) => {
     vnp_Amount: amount * 100, vnp_ReturnUrl: returnUrl, vnp_IpAddr: ip, vnp_CreateDate: vnpDate(new Date())
   };
   p = vnpSortObject(p);
-  const signData = vnpQS(p);
-  p.vnp_SecureHash = crypto.createHmac('sha512', VNP.secret).update(Buffer.from(signData, 'utf-8')).digest('hex');
+  p.vnp_SecureHash = crypto.createHmac('sha512', VNP.secret).update(Buffer.from(vnpQS(p), 'utf-8')).digest('hex');
   res.json({ url: VNP.url + '?' + vnpQS(p) });
 }));
-// VNPAY redirect về đây sau khi thanh toán
 app.get('/api/vnpay/return', async (req, res) => {
   try {
     let p = Object.assign({}, req.query);
     const secureHash = p.vnp_SecureHash; delete p.vnp_SecureHash; delete p.vnp_SecureHashType;
     p = vnpSortObject(p);
-    const signData = vnpQS(p);
-    const check = crypto.createHmac('sha512', VNP.secret).update(Buffer.from(signData, 'utf-8')).digest('hex');
+    const check = crypto.createHmac('sha512', VNP.secret).update(Buffer.from(vnpQS(p), 'utf-8')).digest('hex');
     const ok = secureHash === check && req.query.vnp_ResponseCode === '00';
     if (ok) {
-      // Lưu ý: production nên cộng ví ở IPN (server-to-server), không ở return. Demo cộng ở đây sau khi verify chữ ký.
-      const uid = String(req.query.vnp_TxnRef || '').split('_')[1];
+      const uid = String(req.query.vnp_TxnRef || '').split('_').slice(1).join('_');
       const amount = Math.round((+req.query.vnp_Amount || 0) / 100);
-      const db = await readDB();
-      if (db.users[uid] && amount > 0) {
-        const d = db.users[uid].data;
-        d.balance = (d.balance || 0) + amount;
-        d.tx.unshift({ name: 'Nạp ví qua VNPAY', cat: 'Thu nhập', val: amount, inc: true, d: new Date().getDate() + '/' + (new Date().getMonth() + 1), m: new Date().toISOString().slice(0, 7), src: 'vnpay' });
-        await writeDB(db);
+      const u = await store.userById(uid);
+      if (u && amount > 0) {
+        u.data.balance = (u.data.balance || 0) + amount;
+        u.data.tx.unshift({ name: 'Nạp ví qua VNPAY', cat: 'Thu nhập', val: amount, inc: true, d: new Date().getDate() + '/' + (new Date().getMonth() + 1), m: new Date().toISOString().slice(0, 7), src: 'vnpay' });
+        await store.saveUserData(u.id, u.data);
       }
     }
     res.redirect('/?vnp=' + (ok ? 'success' : 'fail') + '&amt=' + Math.round((+req.query.vnp_Amount || 0) / 100));
@@ -255,27 +261,28 @@ app.get('/api/vnpay/return', async (req, res) => {
 });
 
 /* ---------- Social ---------- */
-app.get('/api/funds', auth(async (req, res) => res.json(req.db.funds.filter(f => f.ownerId === req.uid))));
+app.get('/api/funds', auth(async (req, res) => res.json(await store.fundsByOwner(req.uid))));
 app.post('/api/funds', auth(async (req, res) => {
   const { name, emoji, target } = req.body || {};
   if (!name) return res.status(400).json({ error: 'Thiếu tên quỹ' });
-  const f = { id: rid('f_'), name, emoji: emoji || '🎯', target: +target || 0, ownerId: req.uid, members: [{ name: req.user.name, amount: 0, mine: true }], createdAt: Date.now() };
-  req.db.funds.push(f); await writeDB(req.db); res.json(f);
+  const f = { id: rid('f_'), ownerId: req.uid, name, emoji: emoji || '🎯', target: +target || 0, members: [{ name: req.user.name, amount: 0, mine: true }], createdAt: Date.now() };
+  await store.createFund(f); res.json(f);
 }));
 app.post('/api/funds/:id/member', auth(async (req, res) => {
-  const f = req.db.funds.find(x => x.id === req.params.id && x.ownerId === req.uid);
-  if (!f) return res.status(404).json({ error: 'Không tìm thấy quỹ' });
-  f.members.push({ name: (req.body.name || 'Thành viên').slice(0, 30), amount: 0 }); await writeDB(req.db); res.json(f);
+  const f = await store.fundById(req.params.id);
+  if (!f || f.ownerId !== req.uid) return res.status(404).json({ error: 'Không tìm thấy quỹ' });
+  f.members.push({ name: (req.body.name || 'Thành viên').slice(0, 30), amount: 0 }); await store.saveFund(f); res.json(f);
 }));
 app.post('/api/funds/:id/contribute', auth(async (req, res) => {
-  const f = req.db.funds.find(x => x.id === req.params.id && x.ownerId === req.uid);
-  if (!f) return res.status(404).json({ error: 'Không tìm thấy quỹ' });
+  const f = await store.fundById(req.params.id);
+  if (!f || f.ownerId !== req.uid) return res.status(404).json({ error: 'Không tìm thấy quỹ' });
   const i = Math.max(0, Math.min(f.members.length - 1, +req.body.idx || 0));
-  f.members[i].amount += Math.abs(+req.body.amount || 0); await writeDB(req.db); res.json(f);
+  f.members[i].amount += Math.abs(+req.body.amount || 0); await store.saveFund(f); res.json(f);
 }));
-app.delete('/api/funds/:id', auth(async (req, res) => { req.db.funds = req.db.funds.filter(x => !(x.id === req.params.id && x.ownerId === req.uid)); await writeDB(req.db); res.json({ ok: true }); }));
+app.delete('/api/funds/:id', auth(async (req, res) => { await store.deleteFund(req.params.id, req.uid); res.json({ ok: true }); }));
 app.get('/api/leaderboard', auth(async (req, res) => {
-  const list = Object.values(req.db.users).map(u => {
+  const users = await store.allUsers();
+  const list = users.map(u => {
     const tx = (u.data && u.data.tx) || [];
     const inc = tx.filter(t => t.val > 0).reduce((s, t) => s + t.val, 0);
     const exp = tx.filter(t => t.val < 0).reduce((s, t) => s + Math.abs(t.val), 0);
@@ -286,10 +293,10 @@ app.get('/api/leaderboard', auth(async (req, res) => {
 
 /* ---------- Static + start ---------- */
 app.use(express.static(path.join(__dirname, 'public')));
-initStore().then(() => {
+store.init().then(() => {
   app.listen(PORT, () => {
     console.log('  MoneyMate  ->  http://localhost:' + PORT);
-    console.log('  Lưu trữ: ' + (USE_PG ? 'PostgreSQL (DATABASE_URL)' : 'db.json (local)'));
+    console.log('  Lưu trữ: ' + (store.usingPg() ? 'PostgreSQL (bảng users/tokens/funds)' : 'db.json (local)'));
     console.log('  AI: ' + (KEY ? 'Claude (' + MODEL + ')' : (GEMINI_KEY ? 'Gemini FREE (' + GEMINI_MODEL + ')' : 'TẮT')) + ' | VNPAY: ' + (VNP.tmn ? 'BẬT' : 'chưa cấu hình'));
   });
 }).catch(e => { console.error('Khởi tạo lưu trữ thất bại:', e.message); process.exit(1); });
